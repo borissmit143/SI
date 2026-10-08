@@ -20,8 +20,6 @@ from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_USERS_FILE = APP_DIR / "users.xlsx"
-# Works whether slides/ sits next to the app (flat GitHub repo) or one level up (local project layout).
-SLIDES_DIR = next((path for path in (APP_DIR / "slides", APP_DIR.parent / "slides") if path.is_dir()), APP_DIR / "slides")
 MODEL_NAME = "gemini-3.1-flash-lite"
 CAC_PER_CUSTOMER = 100.0
 PANEL_SIZE = 10
@@ -141,11 +139,49 @@ def deck_slide_texts(archive: zipfile.ZipFile) -> list[str]:
     return texts
 
 
-@st.cache_data(show_spinner=False, ttl=600)
+def pptx_files(folder: Path) -> list[Path]:
+    try:
+        return sorted(
+            path for path in folder.iterdir()
+            if path.is_file() and path.suffix.casefold() == ".pptx" and not path.name.startswith("~$")
+        )
+    except OSError:
+        return []
+
+
+def find_slide_files() -> list[Path]:
+    """Use a slides/ folder (any letter case) next to or above the app; otherwise decks sitting beside the app."""
+    for base in (APP_DIR, APP_DIR.parent):
+        try:
+            folders = [path for path in base.iterdir() if path.is_dir() and path.name.casefold() == "slides"]
+        except OSError:
+            continue
+        for folder in folders:
+            if files := pptx_files(folder):
+                return files
+    return pptx_files(APP_DIR)
+
+
+def slide_file_listing() -> str:
+    """Describe what is next to the app, to explain a missing-slides error."""
+    try:
+        entries = sorted(path.name + ("/" if path.is_dir() else "") for path in APP_DIR.iterdir())
+    except OSError as exc:
+        return str(exc)
+    return ", ".join(entries) or "(empty)"
+
+
 def load_slides() -> tuple[list[dict], list[str]]:
+    # File names, sizes, and times form the cache key, so uploading new decks refreshes the slides.
+    files = find_slide_files()
+    return read_slides(tuple((str(path), path.stat().st_mtime, path.stat().st_size) for path in files))
+
+
+@st.cache_data(show_spinner=False)
+def read_slides(files: tuple[tuple[str, float, int], ...]) -> tuple[list[dict], list[str]]:
     """Return every slide as {label, text}, plus any decks that could not be read."""
     decks, skipped = [], []
-    for path in sorted(SLIDES_DIR.glob("*.pptx")):
+    for path in (Path(name) for name, _, _ in files):
         try:
             with zipfile.ZipFile(path) as archive:
                 decks.append((path, deck_slide_texts(archive)))
@@ -758,7 +794,10 @@ if st.button("Start evaluating", type="primary", use_container_width=True):
     if not idea_text:
         st.error("Add at least one idea to the idea box first.")
     elif not slides:
-        st.error(f"No slide text was found in {SLIDES_DIR}.")
+        st.error(
+            "No slide decks (.pptx) were found. Put them in a folder named `slides` next to the app file. "
+            f"Files next to the app ({APP_DIR}): {slide_file_listing()}"
+        )
     else:
         try:
             with st.spinner(f"{judge['name']} is evaluating the idea against all course slides..."):
