@@ -20,7 +20,8 @@ from pydantic import BaseModel, Field
 
 APP_DIR = Path(__file__).resolve().parent
 DEFAULT_USERS_FILE = APP_DIR / "users.xlsx"
-SLIDES_DIR = APP_DIR.parent / "slides"
+# Works whether slides/ sits next to the app (flat GitHub repo) or one level up (local project layout).
+SLIDES_DIR = next((path for path in (APP_DIR / "slides", APP_DIR.parent / "slides") if path.is_dir()), APP_DIR / "slides")
 MODEL_NAME = "gemini-3.1-flash-lite"
 CAC_PER_CUSTOMER = 100.0
 PANEL_SIZE = 10
@@ -59,16 +60,23 @@ class CollatedIdeas(BaseModel):
     )
 
 
+class CitedPoint(BaseModel):
+    point: str = Field(description="The feedback point itself, without any citation in the text")
+    citation: str = Field(
+        description='The exact bracketed slide label that supports this point, e.g. "Chapter 3, Slide 9"; '
+        'an empty string if no slide genuinely supports it'
+    )
+    evidence: str = Field(
+        description="A phrase of 4-15 words copied word for word from the cited slide; an empty string if no citation"
+    )
+
+
 class Evaluation(BaseModel):
     overall_thoughts: str = Field(description="The judge's overall view of the idea in three to five sentences")
-    slide_concepts_applied: list[str] = Field(
-        description="Course concepts used in the evaluation, each ending with its source as (Chapter X, Slide Y)"
-    )
-    positives: list[str] = Field(description="Strengths of the idea, each citing (Chapter X, Slide Y) where a slide supports it")
-    negatives: list[str] = Field(description="Weaknesses and risks, each citing (Chapter X, Slide Y) where a slide supports it")
-    suggested_changes: list[str] = Field(
-        description="Concrete changes that would improve the idea, each citing the (Chapter X, Slide Y) it draws on"
-    )
+    slide_concepts_applied: list[CitedPoint] = Field(description="Course concepts from the slides used in the evaluation")
+    positives: list[CitedPoint] = Field(description="Strengths of the idea")
+    negatives: list[CitedPoint] = Field(description="Weaknesses and risks of the idea")
+    suggested_changes: list[CitedPoint] = Field(description="Concrete changes that would improve the idea")
     decision: Literal["GO", "NO GO"]
     requests_business_analysis: bool = Field(
         description="True only when the decision is GO and a customer lifetime value analysis is needed before execution"
@@ -81,9 +89,7 @@ class Evaluation(BaseModel):
 class FinalDecision(BaseModel):
     decision: Literal["GO", "NO GO"]
     rationale: str = Field(description="Three to five sentences explaining how the CLV report shaped the decision")
-    conditions: list[str] = Field(
-        description="Conditions, safeguards, or next steps attached to the decision, citing (Chapter X, Slide Y) where relevant"
-    )
+    conditions: list[CitedPoint] = Field(description="Conditions, safeguards, or next steps attached to the decision")
 
 
 class RetentionResponse(BaseModel):
@@ -107,33 +113,81 @@ def load_default_profiles() -> pd.DataFrame:
     return pd.read_excel(DEFAULT_USERS_FILE)
 
 
-@st.cache_data(show_spinner=False)
-def load_slide_text() -> str:
-    """Extract every slide's text from every deck, without needing python-pptx."""
-    decks = []
+def deck_title(path: Path) -> str:
+    chapter = re.search(r"(?:Chapter|Ch)\s*(\d+)", path.stem, flags=re.I)
+    part = re.search(r"Part\s+([IVX]+)", path.stem)
+    title = f"Chapter {chapter.group(1)}" if chapter else path.stem
+    return f"{title} Part {part.group(1)}" if part else title
+
+
+def deck_slide_texts(archive: zipfile.ZipFile) -> list[str]:
+    """Return each slide's text in the order PowerPoint shows them (presentation.xml), not file-name order."""
+    presentation = archive.read("ppt/presentation.xml").decode("utf-8", errors="ignore")
+    relationships = archive.read("ppt/_rels/presentation.xml.rels").decode("utf-8", errors="ignore")
+    targets = {}
+    for tag in re.findall(r"<Relationship\b[^>]*>", relationships):
+        rid, target = re.search(r'\bId="([^"]+)"', tag), re.search(r'\bTarget="([^"]+)"', tag)
+        if rid and target:
+            path = target.group(1).lstrip("/")
+            targets[rid.group(1)] = path if path.startswith("ppt/") else f"ppt/{path}"
+    texts = []
+    for rid in re.findall(r'<p:sldId\b[^>]*\br:id="([^"]+)"', presentation):
+        xml = archive.read(targets[rid]).decode("utf-8", errors="ignore")
+        paragraphs = [
+            " ".join(unescape(run) for run in re.findall(r"<a:t>([^<]*)</a:t>", paragraph))
+            for paragraph in re.findall(r"<a:p>.*?</a:p>", xml, flags=re.S)
+        ]
+        texts.append(" | ".join(line.strip() for line in paragraphs if line.strip()))
+    return texts
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_slides() -> tuple[list[dict], list[str]]:
+    """Return every slide as {label, text}, plus any decks that could not be read."""
+    decks, skipped = [], []
     for path in sorted(SLIDES_DIR.glob("*.pptx")):
-        with zipfile.ZipFile(path) as archive:
-            slide_names = sorted(
-                (name for name in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
-                key=lambda name: int(re.findall(r"\d+", name)[0]),
-            )
-            slides = []
-            for number, name in enumerate(slide_names, start=1):
-                xml = archive.read(name).decode("utf-8", errors="ignore")
-                paragraphs = [
-                    " ".join(unescape(run) for run in re.findall(r"<a:t>([^<]*)</a:t>", paragraph))
-                    for paragraph in re.findall(r"<a:p>.*?</a:p>", xml, flags=re.S)
-                ]
-                text = " | ".join(line.strip() for line in paragraphs if line.strip())
-                if text:
-                    slides.append(f"Slide {number}: {text}")
-        chapter = re.search(r"(?:Chapter|Ch)\s*(\d+)", path.stem, flags=re.I)
-        part = re.search(r"Part\s+([IVX]+)", path.stem)
-        title = f"Chapter {chapter.group(1)}" if chapter else path.stem
-        if part:
-            title += f" Part {part.group(1)}"
-        decks.append(f"### {title} (file: {path.name})\n" + "\n".join(slides))
-    return "\n\n".join(decks)
+        try:
+            with zipfile.ZipFile(path) as archive:
+                decks.append((path, deck_slide_texts(archive)))
+        except (OSError, KeyError, zipfile.BadZipFile) as exc:
+            skipped.append(f"{path.name} ({exc})")
+    titles = [deck_title(path) for path, _ in decks]
+    slides = []
+    for (path, texts), title in zip(decks, titles):
+        # Several decks for one chapter get the file name so each label stays unique.
+        if titles.count(title) > 1:
+            title = f"{title} [{path.stem}]"
+        for number, text in enumerate(texts, start=1):
+            if text:
+                slides.append({"label": f"{title}, Slide {number}", "text": text})
+    return slides, skipped
+
+
+def slides_for_prompt(slides: list[dict]) -> str:
+    chapters = sorted({slide["label"].rsplit(", Slide", 1)[0] for slide in slides})
+    lines = "\n".join(f"[{slide['label']}] {slide['text']}" for slide in slides)
+    return f"Decks available (no other chapters exist): {'; '.join(chapters)}\n\n{lines}"
+
+
+def normalize(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.casefold()).strip()
+
+
+def verify_citation(item: dict, slides: list[dict]) -> dict:
+    """Keep a citation only if its evidence phrase really appears on a slide; re-point it if on another slide."""
+    evidence = normalize(item.get("evidence", ""))
+    claimed = next((slide for slide in slides if normalize(slide["label"]) == normalize(item.get("citation", ""))), None)
+    if len(evidence.split()) >= 3:
+        if claimed and evidence in normalize(claimed["text"]):
+            return {**item, "citation": claimed["label"], "status": "verified"}
+        match = next((slide for slide in slides if evidence in normalize(slide["text"])), None)
+        if match:
+            return {**item, "citation": match["label"], "status": "corrected"}
+    return {**item, "citation": "", "status": "removed" if item.get("citation") else "none"}
+
+
+def verify_points(record: dict, fields: tuple[str, ...], slides: list[dict]) -> dict:
+    return {**record, **{field: [verify_citation(item, slides) for item in record[field]] for field in fields}}
 
 
 def matching_column(dataframe: pd.DataFrame, wanted: str) -> str | None:
@@ -338,6 +392,12 @@ Do not add ideas no one discussed."""
     return invoke_with_retry(make_llm(api_key, CollatedIdeas, temperature=0.3), prompt)
 
 
+CITATION_RULES = """Citation rules (they are checked automatically against the slide text):
+- Give every feedback point a citation copied exactly from a bracketed slide label above, e.g. "Chapter 3, Slide 9".
+- In evidence, copy 4-15 consecutive words word for word from that same slide, so the team can find it.
+- Never guess a chapter or slide number. If no slide genuinely supports a point, leave citation and evidence empty."""
+
+
 def evaluation_prompt(context: dict, judge: dict, idea: str, slides: str) -> str:
     return f"""You are {judge['name']}, now acting as the judge of a service-innovation workshop. Evaluate the idea
 as a rigorous services-marketing expert who applies the course material below, while keeping your customer perspective.
@@ -350,19 +410,17 @@ Your customer profile:
 The idea the team selected for evaluation:
 \"\"\"{idea}\"\"\"
 
-Course slides (all decks, full text):
+Course slides (all decks, full text; each line starts with that slide's label in brackets):
 {slides}
 
-Evaluate the idea using the concepts in these slides wherever they apply. Whenever you give feedback (a concept,
-positive, negative, or suggested change), cite where it comes from as (Chapter X, Slide Y) using the chapter headings
-and slide numbers above, so the team can look it up. Cite only slides that actually contain the concept.
+{CITATION_RULES}
 Judge fit with the firm's mission and the selected innovation strategy, customer value, feasibility, and risks.
 Be balanced and specific: list positives, negatives, and concrete suggested changes, then decide GO (the idea can be
 executed) or NO GO. If and only if you decide GO and you want evidence of long-term customer value before execution,
 request a business analysis (a five-year customer lifetime value / CLV:CAC simulation) and say what it should show."""
 
 
-def final_decision_prompt(context: dict, judge: dict, idea: str, evaluation: dict, report: str) -> str:
+def final_decision_prompt(context: dict, judge: dict, idea: str, evaluation: dict, report: str, slides: str) -> str:
     return f"""You are {judge['name']}, the judge of this service-innovation workshop.
 
 {firm_context(context)}
@@ -379,11 +437,12 @@ The team has sent you this CLV business analysis report:
 
 Make the final GO / NO GO decision. A CLV:CAC ratio of about 3:1 or higher is commonly treated as healthy, and a
 ratio below 1:1 means customers are worth less than they cost to acquire. Weigh the numbers together with your
-earlier evaluation, explain your rationale, and list any conditions or next steps. When feedback draws on the course
-material, cite it as (Chapter X, Slide Y) using the slides below.
+earlier evaluation, explain your rationale, and list any conditions or next steps.
 
-Course slides (all decks, full text):
-{load_slide_text()}"""
+Course slides (all decks, full text; each line starts with that slide's label in brackets):
+{slides}
+
+{CITATION_RULES}"""
 
 
 def clv_prompt(context: dict, idea: str, persona: str, profile: dict[str, str]) -> str:
@@ -515,8 +574,26 @@ Sample of customer reasons:
 {reasons}"""
 
 
-def bullet_list(items: list[str]) -> str:
-    return "\n".join(f"- {item}" for item in items) or "- None"
+def cited_text(item: str | dict) -> str:
+    if isinstance(item, str):
+        return item
+    if item["status"] in ("verified", "corrected"):
+        return f"{item['point']} *({item['citation']})*"
+    if item["status"] == "removed":
+        return f"{item['point']} *(slide citation removed: not found in the slides)*"
+    return item["point"]
+
+
+def bullet_list(items: list[str | dict]) -> str:
+    return "\n".join(f"- {cited_text(item)}" for item in items) or "- None"
+
+
+def evidence_list(*groups: list[dict]) -> str:
+    quotes = {
+        (item["citation"], item["evidence"]) for group in groups for item in group
+        if item["status"] in ("verified", "corrected")
+    }
+    return "\n".join(f"- **{citation}**: “{evidence}”" for citation, evidence in sorted(quotes)) or "- No verified citations"
 
 
 def workshop_markdown(context: dict, idea: str, evaluation: dict | None, final: dict | None, report: str | None) -> str:
@@ -674,17 +751,28 @@ if idea_text:
     st.code(idea_text, language=None, wrap_lines=True)
 
 st.subheader("6. Evaluate")
+slides, skipped_decks = load_slides()
+if skipped_decks:
+    st.warning("These slide decks could not be read (close them in PowerPoint/OneDrive and reload): " + "; ".join(skipped_decks))
 if st.button("Start evaluating", type="primary", use_container_width=True):
     if not idea_text:
         st.error("Add at least one idea to the idea box first.")
+    elif not slides:
+        st.error(f"No slide text was found in {SLIDES_DIR}.")
     else:
         try:
             with st.spinner(f"{judge['name']} is evaluating the idea against all course slides..."):
                 evaluation = invoke_with_retry(
                     make_llm(api_key, Evaluation, temperature=0.3),
-                    evaluation_prompt(session_context, judge, idea_text, load_slide_text()),
+                    evaluation_prompt(session_context, judge, idea_text, slides_for_prompt(slides)),
                 )
-            st.session_state["evaluation"] = {**evaluation.model_dump(), "idea": idea_text}
+            st.session_state["evaluation"] = {
+                **verify_points(
+                    evaluation.model_dump(),
+                    ("slide_concepts_applied", "positives", "negatives", "suggested_changes"), slides,
+                ),
+                "idea": idea_text,
+            }
             clear_downstream("clv_innovation", "final_decision")
         except Exception as exc:
             st.error(f"Could not evaluate the idea: {exc}")
@@ -703,6 +791,14 @@ negative_col.markdown("**👎 Negatives**\n" + bullet_list(evaluation["negatives
 st.markdown("**🛠️ Suggested changes**\n" + bullet_list(evaluation["suggested_changes"]))
 with st.expander("Course concepts the judge applied"):
     st.markdown(bullet_list(evaluation["slide_concepts_applied"]))
+with st.expander("Slide evidence behind each citation"):
+    st.caption(
+        "Every citation shown was checked: its quoted phrase appears on that slide. "
+        "Citations whose quote could not be found in any slide were removed."
+    )
+    st.markdown(evidence_list(*(evaluation[field] for field in (
+        "slide_concepts_applied", "positives", "negatives", "suggested_changes"
+    ))))
 decision_banner(
     evaluation["decision"],
     "the idea can be executed." if evaluation["decision"] == "GO" else "the idea should not be executed as it stands.",
@@ -775,9 +871,11 @@ if wants_analysis:
                 with st.spinner(f"{judge['name']} is reviewing the CLV report..."):
                     decision = invoke_with_retry(
                         make_llm(api_key, FinalDecision, temperature=0.3),
-                        final_decision_prompt(session_context, judge, evaluation["idea"], evaluation, report),
+                        final_decision_prompt(
+                            session_context, judge, evaluation["idea"], evaluation, report, slides_for_prompt(slides)
+                        ),
                     )
-                st.session_state["final_decision"] = final = decision.model_dump()
+                st.session_state["final_decision"] = final = verify_points(decision.model_dump(), ("conditions",), slides)
             except Exception as exc:
                 st.error(f"Could not get the final decision: {exc}")
 
@@ -785,6 +883,8 @@ if wants_analysis:
             st.subheader(f"8. ⚖️ {judge['name']}'s final decision")
             decision_banner(final["decision"], final["rationale"])
             st.markdown("**Conditions and next steps**\n" + bullet_list(final["conditions"]))
+            with st.expander("Slide evidence behind the final decision"):
+                st.markdown(evidence_list(final["conditions"]))
 elif evaluation["decision"] == "GO":
     st.caption(f"{judge['name']} did not request a business analysis; the GO decision stands.")
 else:
